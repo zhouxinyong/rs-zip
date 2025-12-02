@@ -16,9 +16,9 @@
 ## Installation
 
 ```bash
-yarn add rs-zip
+yarn add @rsdx/rs-zip
 # or
-npm install rs-zip
+npm install @rsdx/rs-zip
 ```
 
 ## Usage
@@ -26,7 +26,7 @@ npm install rs-zip
 ### Compress a Directory
 
 ```javascript
-const { zip } = require('rs-zip')
+const { zip } = require('@rsdx/rs-zip')
 
 async function compress() {
   try {
