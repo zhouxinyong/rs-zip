@@ -1,11 +1,11 @@
 {
   "name": "rs-zip",
-  "version": "0.0.2",
+  "version": "0.0.1",
   "description": "A Node.js package for compressing directories using Rust.",
   "main": "index.js",
   "repository": {
     "type": "git",
-    "url": "git+ssh://git@github.com:zhouxinyong/rs-zip.git"
+    "url": "git+ssh://git@github.com/zhouxinyong/rs-zip.git"
   },
   "license": "MIT",
   "keywords": [
