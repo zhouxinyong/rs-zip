@@ -220,6 +220,7 @@ impl Task for UncompressTask {
         std::fs::create_dir_all(&outpath)
           .map_err(|e| Error::from_reason(format!("创建目录失败: {}", e)))?;
       } else {
+        #[allow(clippy::collapsible_if)]
         if let Some(p) = outpath.parent() {
           if !p.exists() {
             std::fs::create_dir_all(p)
