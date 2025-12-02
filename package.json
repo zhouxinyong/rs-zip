@@ -1,6 +1,6 @@
 {
   "name": "rs-zip",
-  "version": "0.0.3",
+  "version": "0.0.1",
   "description": "A Node.js package for compressing directories using Rust.",
   "main": "index.js",
   "repository": {
@@ -34,8 +34,7 @@
       "x86_64-unknown-freebsd",
       "aarch64-unknown-linux-musl",
       "aarch64-pc-windows-msvc",
-      "armv7-linux-androideabi",
-      "wasm32-wasip1-threads"
+      "armv7-linux-androideabi"
     ]
   },
   "engines": {
