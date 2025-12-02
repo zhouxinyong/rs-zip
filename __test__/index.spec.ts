@@ -6,8 +6,6 @@ import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync, 
 
 const TEST_DIR = join(process.cwd(), 'temp_test_dir')
 const SRC_DIR = join(TEST_DIR, 'src')
-const OUT_ZIP = join(TEST_DIR, 'test.zip')
-const OUT_DIR = join(TEST_DIR, 'out')
 const INVALID_ZIP = join(TEST_DIR, 'invalid.zip')
 
 test.before(() => {
