@@ -36,7 +36,7 @@ async function compress() {
 
     // With options
     const count2 = await zip('./src', './archive_filtered.zip', {
-      level: 9, // 0-9, default is 6
+      level: 9, // 0-9, default is 1
       exclude: ['*.tmp', '.git/**', 'node_modules/**'], // Glob patterns
     })
   } catch (err) {
@@ -72,7 +72,7 @@ Compresses a directory into a zip file. Returns the number of files compressed.
 
 **Options:**
 
-- `level` (number): Compression level from 0 (store) to 9 (best). Default: `6`.
+- `level` (number): Compression level from 0 (store) to 9 (best). Default: `1`.
 - `exclude` (string[]): Array of glob patterns to exclude from the archive.
 
 ### `unzip(sourcePath: string, outputDir: string): Promise<void>`
