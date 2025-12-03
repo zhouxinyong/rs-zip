@@ -107,8 +107,8 @@ impl Task for CompressTask {
           .start_file(name, options)
           .map_err(|e| Error::from_reason(format!("Failed to write zip entry: {}", e)))?;
 
-        let mut f =
-          File::open(path).map_err(|e| Error::from_reason(format!("Failed to read source file: {}", e)))?;
+        let mut f = File::open(path)
+          .map_err(|e| Error::from_reason(format!("Failed to read source file: {}", e)))?;
 
         // Stream copy
         loop {
@@ -160,9 +160,9 @@ impl Task for CompressTask {
 }
 
 /// Compress a directory into a zip file.
-/// 
+///
 /// Returns the number of files compressed.
-/// 
+///
 /// # Arguments
 /// * `source_dir` - Source directory path
 /// * `output_path` - Output zip file path
@@ -228,8 +228,9 @@ impl Task for UncompressTask {
         #[allow(clippy::collapsible_if)]
         if let Some(p) = outpath.parent() {
           if !p.exists() {
-            std::fs::create_dir_all(p)
-              .map_err(|e| Error::from_reason(format!("Failed to create parent directory: {}", e)))?;
+            std::fs::create_dir_all(p).map_err(|e| {
+              Error::from_reason(format!("Failed to create parent directory: {}", e))
+            })?;
           }
         }
         let mut outfile = File::create(&outpath)
@@ -258,11 +259,11 @@ impl Task for UncompressTask {
 }
 
 /// Decompress a zip file into a directory.
-/// 
+///
 /// Automatically creates the output directory if it doesn't exist.
 /// Safely handles paths to prevent writing outside the target directory (Zip Slip protection).
 /// Restores file permissions on Unix systems.
-/// 
+///
 /// # Arguments
 /// * `source_path` - Source zip file path
 /// * `output_dir` - Output directory path
