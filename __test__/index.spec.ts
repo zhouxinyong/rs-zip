@@ -85,6 +85,6 @@ test('zip rejects invalid level', async (t) => {
       // @ts-ignore testing runtime validation
       await zip(SRC_DIR, INVALID_ZIP, { level: 42 })
     },
-    { message: /0 到 9/ },
+    { message: /between 0 and 9/ },
   )
 })
