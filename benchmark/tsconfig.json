@@ -5,6 +5,6 @@
     "module": "NodeNext",
     "outDir": "lib"
   },
-  "include": ["."],
+  "include": [".", "../zip-dir.d.ts"],
   "exclude": ["lib"]
 }

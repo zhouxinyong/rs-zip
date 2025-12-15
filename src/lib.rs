@@ -1,21 +1,50 @@
 #![deny(clippy::all)]
 
-use glob::Pattern;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use napi::bindgen_prelude::AsyncTask;
 use napi::{Env, Error, Result, Task};
 use napi_derive::napi;
+use rayon::prelude::*;
+use std::borrow::Cow;
 use std::fs::File;
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
-use walkdir::WalkDir;
+use walkdir::{DirEntry, WalkDir};
 
-use zip::CompressionMethod;
 use zip::write::SimpleFileOptions;
+use zip::CompressionMethod;
+
+/// Prepared file data for parallel reading
+struct FileData {
+  name: String,
+  content: Vec<u8>,
+  #[cfg(unix)]
+  mode: Option<u32>,
+  #[cfg(not(unix))]
+  _mode: (),
+}
+
+/// Prepared directory entry for writing
+struct DirData {
+  name: String,
+  #[cfg(unix)]
+  mode: Option<u32>,
+  #[cfg(not(unix))]
+  _mode: (),
+}
+
+/// Result of parallel file collection
+enum EntryData {
+  File(FileData),
+  Dir(DirData),
+}
 
 #[napi(object)]
 pub struct ZipOptions {
   pub level: Option<i32>,
   pub exclude: Option<Vec<String>>,
+  /// Compression algorithm: "deflate" (default), "bzip2", or "zstd"
+  pub algorithm: Option<String>,
 }
 
 pub struct CompressTask {
@@ -24,123 +53,185 @@ pub struct CompressTask {
   pub options: ZipOptions,
 }
 
+/// Normalize path to zip format (forward slashes)
+fn normalize_path(name_str: &str) -> Cow<'_, str> {
+  #[cfg(windows)]
+  {
+    if name_str.contains('\\') {
+      Cow::Owned(name_str.replace('\\', "/"))
+    } else {
+      Cow::Borrowed(name_str)
+    }
+  }
+  #[cfg(not(windows))]
+  {
+    Cow::Borrowed(name_str)
+  }
+}
+
+/// Process a directory entry for parallel collection
+fn process_entry(
+  entry: &DirEntry,
+  source_dir: &PathBuf,
+  exclude_matcher: &Option<GlobSet>,
+) -> Option<EntryData> {
+  let path = entry.path();
+  let file_type = entry.file_type();
+
+  // Calculate relative path
+  let name_path = path.strip_prefix(source_dir).ok()?;
+  let name_str = name_path.to_str()?;
+
+  // Filter by glob patterns
+  if let Some(ref matcher) = exclude_matcher {
+    if matcher.is_match(name_str) {
+      return None;
+    }
+  }
+
+  let name = normalize_path(name_str).into_owned();
+
+  if file_type.is_file() {
+    // Read file content
+    let content = std::fs::read(path).ok()?;
+
+    #[cfg(unix)]
+    let mode = {
+      use std::os::unix::fs::PermissionsExt;
+      entry.metadata().ok().map(|m| m.permissions().mode())
+    };
+
+    Some(EntryData::File(FileData {
+      name,
+      content,
+      #[cfg(unix)]
+      mode,
+      #[cfg(not(unix))]
+      _mode: (),
+    }))
+  } else if file_type.is_dir() && !name.is_empty() {
+    #[cfg(unix)]
+    let mode = {
+      use std::os::unix::fs::PermissionsExt;
+      entry.metadata().ok().map(|m| m.permissions().mode())
+    };
+
+    Some(EntryData::Dir(DirData {
+      name,
+      #[cfg(unix)]
+      mode,
+      #[cfg(not(unix))]
+      _mode: (),
+    }))
+  } else {
+    None
+  }
+}
+
 impl Task for CompressTask {
   type Output = u32;
   type JsValue = u32;
 
   fn compute(&mut self) -> Result<Self::Output> {
-    // 1. Create file stream with buffer
+    // 1. Build GlobSet for pattern matching (with error reporting)
+    let exclude_matcher = if let Some(ref patterns) = self.options.exclude {
+      let mut builder = GlobSetBuilder::new();
+      for pattern in patterns {
+        let glob = Glob::new(pattern)
+          .map_err(|e| Error::from_reason(format!("Invalid glob pattern '{}': {}", pattern, e)))?;
+        builder.add(glob);
+      }
+      Some(
+        builder
+          .build()
+          .map_err(|e| Error::from_reason(format!("Failed to build glob matcher: {}", e)))?,
+      )
+    } else {
+      None
+    };
+
+    // 2. Configure compression options with algorithm validation
+    let compression_level = self.options.level.unwrap_or(1);
+    let compression_method = match self.options.algorithm.as_deref() {
+      Some("deflate") | None => CompressionMethod::Deflated,
+      Some("bzip2") => CompressionMethod::Bzip2,
+      Some("zstd") => CompressionMethod::Zstd,
+      Some(alg) => {
+        return Err(Error::from_reason(format!(
+          "Unsupported algorithm '{}'. Valid options: deflate, bzip2, zstd",
+          alg
+        )))
+      }
+    };
+
+    let base_options = SimpleFileOptions::default()
+      .compression_method(compression_method)
+      .compression_level(Some(compression_level as i64))
+      .large_file(true);
+
+    // 3. Collect all entries
+    let entries: Vec<_> = WalkDir::new(&self.source_dir)
+      .follow_links(false)
+      .into_iter()
+      .filter_map(|e| e.ok())
+      .collect();
+
+    // 4. Parallel processing: pipeline
+    // Use a bounded channel to prevent memory from exploding if reading is faster than writing
+    let (tx, rx) = std::sync::mpsc::sync_channel(32);
+
+    // ARC needed for sharing data across threads
+    let source_dir = self.source_dir.clone();
+
+    // Spawn producer threads
+    rayon::spawn(move || {
+      entries.par_iter().for_each_with(tx, |tx, entry| {
+        if let Some(data) = process_entry(entry, &source_dir, &exclude_matcher) {
+          // If the channel is full, this will block the rayon thread, providing backpressure
+          let _ = tx.send(data);
+        }
+      });
+    });
+
+    // 5. Create zip file and write sequentially
     let file = File::create(&self.output_path)
       .map_err(|e| Error::from_reason(format!("Failed to create zip file: {}", e)))?;
-
-    // 64KB write buffer
-    let buf_writer = BufWriter::with_capacity(65536, file);
+    let buf_writer = BufWriter::with_capacity(262144, file);
     let mut zip = zip::ZipWriter::new(buf_writer);
 
-    // Parse exclude patterns
-    let exclude_patterns: Vec<Pattern> = self
-      .options
-      .exclude
-      .as_ref()
-      .map(|patterns| {
-        patterns
-          .iter()
-          .filter_map(|p| Pattern::new(p).ok())
-          .collect()
-      })
-      .unwrap_or_default();
+    let mut file_count = 0u32;
 
-    // 2. Configure base compression options
-    let compression_level = self.options.level.unwrap_or(1);
-    let base_options = SimpleFileOptions::default()
-      .compression_method(CompressionMethod::Deflated)
-      .compression_level(Some(compression_level as i64))
-      .large_file(true); // Enable Zip64
-
-    let walk = WalkDir::new(&self.source_dir);
-    let mut buffer = vec![0; 65536]; // Reusable 64KB read buffer
-    let mut file_count = 0;
-
-    for entry in walk.into_iter().filter_map(|e| e.ok()) {
-      let path = entry.path();
-
-      // 3. Calculate and normalize path
-      let name_path = path
-        .strip_prefix(&self.source_dir)
-        .map_err(|e| Error::from_reason(format!("Path resolution error: {}", e)))?;
-
-      let name_str = name_path
-        .to_str()
-        .ok_or(Error::from_reason("Path contains invalid characters"))?;
-
-      // 4. Filter files
-      let mut matched = false;
-      for pattern in &exclude_patterns {
-        if pattern.matches(name_str) {
-          matched = true;
-          break;
-        }
-      }
-      if matched {
-        continue;
-      }
-
-      // Normalize path separator to / on Windows
-      #[cfg(windows)]
-      let name = name_str.replace("\\", "/");
-      #[cfg(not(windows))]
-      let name = name_str.to_string();
-
-      if path.is_file() {
-        // 5. Get file permissions
-        let mut options = base_options;
-
-        #[cfg(unix)]
-        {
-          use std::os::unix::fs::PermissionsExt;
-          if let Ok(metadata) = std::fs::metadata(path) {
-            options = options.unix_permissions(metadata.permissions().mode());
-          }
-        }
-
-        zip
-          .start_file(name, options)
-          .map_err(|e| Error::from_reason(format!("Failed to write zip entry: {}", e)))?;
-
-        let mut f = File::open(path)
-          .map_err(|e| Error::from_reason(format!("Failed to read source file: {}", e)))?;
-
-        // Stream copy
-        loop {
-          let count = f
-            .read(&mut buffer)
-            .map_err(|e| Error::from_reason(format!("File stream read interrupted: {}", e)))?;
-          if count == 0 {
-            break;
-          }
-          zip
-            .write_all(&buffer[..count])
-            .map_err(|e| Error::from_reason(format!("Failed to write data: {}", e)))?;
-        }
-        file_count += 1;
-      } else if !name.is_empty() {
-        // Add directory
-        #[cfg(unix)]
-        {
-          // Preserve directory permissions
+    // Consumer: write to zip as data arrives
+    for data in rx {
+      match data {
+        EntryData::File(file_data) => {
           let mut options = base_options;
-          use std::os::unix::fs::PermissionsExt;
-          if let Ok(metadata) = std::fs::metadata(path) {
-            options = options.unix_permissions(metadata.permissions().mode());
+
+          #[cfg(unix)]
+          if let Some(mode) = file_data.mode {
+            options = options.unix_permissions(mode);
           }
+
           zip
-            .add_directory(name, options)
-            .map_err(|e| Error::from_reason(format!("Failed to add directory: {}", e)))?;
+            .start_file(&file_data.name, options)
+            .map_err(|e| Error::from_reason(format!("Failed to write zip entry: {}", e)))?;
+
+          zip
+            .write_all(&file_data.content)
+            .map_err(|e| Error::from_reason(format!("Failed to write data: {}", e)))?;
+
+          file_count += 1;
         }
-        #[cfg(not(unix))]
-        {
+        EntryData::Dir(dir_data) => {
+          let mut options = base_options;
+
+          #[cfg(unix)]
+          if let Some(mode) = dir_data.mode {
+            options = options.unix_permissions(mode);
+          }
+
           zip
-            .add_directory(name, base_options)
+            .add_directory(&dir_data.name, options)
             .map_err(|e| Error::from_reason(format!("Failed to add directory: {}", e)))?;
         }
       }
@@ -169,17 +260,35 @@ impl Task for CompressTask {
 /// * `options` - Compression options
 ///   - `level`: Compression level (0-9, default: 1)
 ///   - `exclude`: Array of glob patterns to exclude files
+///   - `algorithm`: Compression algorithm (deflate, bzip2, zstd)
 #[napi(ts_return_type = "Promise<number>")]
 pub fn zip(
   source_dir: String,
   output_path: String,
   options: Option<ZipOptions>,
 ) -> Result<AsyncTask<CompressTask>> {
+  // Validate source directory
+  let source_path = PathBuf::from(&source_dir);
+  if !source_path.exists() {
+    return Err(Error::from_reason(format!(
+      "Source not found: {}",
+      source_dir
+    )));
+  }
+  if !source_path.is_dir() {
+    return Err(Error::from_reason(format!(
+      "Source is not a directory: {}",
+      source_dir
+    )));
+  }
+
   let opts = options.unwrap_or(ZipOptions {
     level: Some(1),
     exclude: None,
+    algorithm: None,
   });
 
+  // Validate compression level
   let compression_level = opts.level.unwrap_or(1);
   if !(0..=9).contains(&compression_level) {
     return Err(Error::from_reason(format!(
@@ -189,7 +298,7 @@ pub fn zip(
   }
 
   Ok(AsyncTask::new(CompressTask {
-    source_dir: PathBuf::from(source_dir),
+    source_dir: source_path,
     output_path: PathBuf::from(output_path),
     options: opts,
   }))
@@ -207,7 +316,9 @@ impl Task for UncompressTask {
   fn compute(&mut self) -> Result<Self::Output> {
     let file = File::open(&self.source_path)
       .map_err(|e| Error::from_reason(format!("Failed to open zip file: {}", e)))?;
-    let mut archive = zip::ZipArchive::new(file)
+
+    let buf_reader = BufReader::with_capacity(262144, file);
+    let mut archive = zip::ZipArchive::new(buf_reader)
       .map_err(|e| Error::from_reason(format!("Failed to read zip archive: {}", e)))?;
 
     for i in 0..archive.len() {
@@ -215,7 +326,7 @@ impl Task for UncompressTask {
         .by_index(i)
         .map_err(|e| Error::from_reason(format!("Failed to read zip entry: {}", e)))?;
 
-      // Security check: Zip Slip
+      // Security: Zip Slip protection
       let outpath = match file.enclosed_name() {
         Some(path) => self.output_dir.join(path),
         None => continue,
@@ -233,10 +344,17 @@ impl Task for UncompressTask {
             })?;
           }
         }
-        let mut outfile = File::create(&outpath)
+
+        let outfile = File::create(&outpath)
           .map_err(|e| Error::from_reason(format!("Failed to create output file: {}", e)))?;
-        std::io::copy(&mut file, &mut outfile)
+        let mut buf_writer = BufWriter::with_capacity(262144, outfile);
+
+        std::io::copy(&mut file, &mut buf_writer)
           .map_err(|e| Error::from_reason(format!("Failed to decompress file content: {}", e)))?;
+
+        buf_writer
+          .flush()
+          .map_err(|e| Error::from_reason(format!("Failed to flush output file: {}", e)))?;
       }
 
       // Restore permissions (Unix only)
@@ -268,9 +386,24 @@ impl Task for UncompressTask {
 /// * `source_path` - Source zip file path
 /// * `output_dir` - Output directory path
 #[napi(ts_return_type = "Promise<void>")]
-pub fn unzip(source_path: String, output_dir: String) -> AsyncTask<UncompressTask> {
-  AsyncTask::new(UncompressTask {
-    source_path: PathBuf::from(source_path),
+pub fn unzip(source_path: String, output_dir: String) -> Result<AsyncTask<UncompressTask>> {
+  // Validate source file
+  let path = PathBuf::from(&source_path);
+  if !path.exists() {
+    return Err(Error::from_reason(format!(
+      "Zip file not found: {}",
+      source_path
+    )));
+  }
+  if !path.is_file() {
+    return Err(Error::from_reason(format!(
+      "Path is not a file: {}",
+      source_path
+    )));
+  }
+
+  Ok(AsyncTask::new(UncompressTask {
+    source_path: path,
     output_dir: PathBuf::from(output_dir),
-  })
+  }))
 }

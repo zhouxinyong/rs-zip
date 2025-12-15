@@ -28,7 +28,7 @@ b.add('rs-zip (Rust)', async () => {
 
 b.add('zip-dir (JS)', async () => {
   await new Promise<void>((resolve, reject) => {
-    zipDir(SRC_DIR, { saveTo: OUT_NODE_ZIP }, (err) => {
+    zipDir(SRC_DIR, { saveTo: OUT_NODE_ZIP }, (err: any) => {
       if (err) reject(err)
       else resolve()
     })

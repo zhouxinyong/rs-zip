@@ -24,6 +24,7 @@ export declare function unzip(sourcePath: string, outputDir: string): Promise<vo
  * * `options` - Compression options
  *   - `level`: Compression level (0-9, default: 1)
  *   - `exclude`: Array of glob patterns to exclude files
+ *   - `algorithm`: Compression algorithm (deflate, bzip2, zstd)
  */
 export declare function zip(
   sourceDir: string,
@@ -34,4 +35,6 @@ export declare function zip(
 export interface ZipOptions {
   level?: number
   exclude?: Array<string>
+  /** Compression algorithm: "deflate" (default), "bzip2", or "zstd" */
+  algorithm?: string
 }
