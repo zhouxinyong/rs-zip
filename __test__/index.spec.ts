@@ -2,7 +2,7 @@ import test from 'ava'
 import rsZip from '../index.js'
 const { zip, unzip } = rsZip
 import { join } from 'path'
-import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync, statSync } from 'fs'
+import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync, statSync, symlinkSync } from 'fs'
 
 const TEST_DIR = join(process.cwd(), 'temp_test_dir')
 const SRC_DIR = join(TEST_DIR, 'src')
@@ -22,6 +22,15 @@ test.before(() => {
 
   // Set executable permission for script.sh (755)
   chmodSync(join(SRC_DIR, 'script.sh'), 0o755)
+
+  // Create a symlink for symlink tests (Unix only)
+  if (process.platform !== 'win32') {
+    try {
+      symlinkSync(join(SRC_DIR, 'file1.txt'), join(SRC_DIR, 'link.txt'))
+    } catch {
+      // Ignore if symlink creation fails
+    }
+  }
 })
 
 test.after.always(() => {
@@ -37,6 +46,7 @@ test('zip and unzip basic', async (t) => {
   // 1. Zip
   const count = await zip(SRC_DIR, outZip)
   // 5 files total: file1, file2, subdir/file3, ignore.tmp, script.sh
+  // (symlink is NOT followed by default, so link.txt is excluded)
   t.is(count, 5, 'Should compress 5 files')
   t.true(existsSync(outZip), 'Zip file should exist')
 
@@ -86,5 +96,76 @@ test('zip rejects invalid level', async (t) => {
       await zip(SRC_DIR, INVALID_ZIP, { level: 42 })
     },
     { message: /between 0 and 9/ },
+  )
+})
+
+test('zip rejects invalid level for zstd', async (t) => {
+  await t.throwsAsync(
+    async () => {
+      await zip(SRC_DIR, INVALID_ZIP, { level: 30, algorithm: 'zstd' })
+    },
+    { message: /between 1 and 22/ },
+  )
+})
+
+test('zip with zstd algorithm', async (t) => {
+  const outZip = join(TEST_DIR, 'zstd.zip')
+  const outDir = join(TEST_DIR, 'out_zstd')
+
+  const count = await zip(SRC_DIR, outZip, { algorithm: 'zstd', level: 3 })
+  t.true(count > 0, 'Should compress files with zstd')
+
+  await unzip(outZip, outDir)
+  t.is(readFileSync(join(outDir, 'file1.txt'), 'utf8'), 'Hello World')
+})
+
+test('zip with bzip2 algorithm', async (t) => {
+  const outZip = join(TEST_DIR, 'bzip2.zip')
+  const outDir = join(TEST_DIR, 'out_bzip2')
+
+  const count = await zip(SRC_DIR, outZip, { algorithm: 'bzip2', level: 5 })
+  t.true(count > 0, 'Should compress files with bzip2')
+
+  await unzip(outZip, outDir)
+  t.is(readFileSync(join(outDir, 'file1.txt'), 'utf8'), 'Hello World')
+})
+
+test('zip creates parent directories for output', async (t) => {
+  const outZip = join(TEST_DIR, 'nested', 'deep', 'output.zip')
+  const outDir = join(TEST_DIR, 'out_nested')
+
+  const count = await zip(SRC_DIR, outZip)
+  t.true(count > 0, 'Should compress files')
+  t.true(existsSync(outZip), 'Zip file should exist in nested directory')
+
+  await unzip(outZip, outDir)
+  t.is(readFileSync(join(outDir, 'file1.txt'), 'utf8'), 'Hello World')
+})
+
+test('zip with followSymlinks', async (t) => {
+  if (process.platform === 'win32') {
+    t.pass('Skipping symlink test on Windows')
+    return
+  }
+
+  const outZip = join(TEST_DIR, 'symlinks.zip')
+  const outDir = join(TEST_DIR, 'out_symlinks')
+
+  // With followSymlinks: true, the symlink target should be included
+  const count = await zip(SRC_DIR, outZip, { followSymlinks: true })
+  // 6 files: file1, file2, subdir/file3, ignore.tmp, script.sh, link.txt
+  t.is(count, 6, 'Should compress 6 files (including symlink target)')
+
+  await unzip(outZip, outDir)
+  t.true(existsSync(join(outDir, 'link.txt')), 'Symlink target file should exist')
+  t.is(readFileSync(join(outDir, 'link.txt'), 'utf8'), 'Hello World')
+})
+
+test('zip propagates directory read errors', async (t) => {
+  await t.throwsAsync(
+    async () => {
+      await zip('/nonexistent/path', INVALID_ZIP)
+    },
+    { message: /Source not found/ },
   )
 })

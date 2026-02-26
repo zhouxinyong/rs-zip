@@ -4,7 +4,7 @@
 
 ## Features
 
-- **High Performance**: Powered by Rust with optimized buffering (BufWriter/BufReader).
+- **High Performance**: Powered by Rust with streaming I/O and optimized buffering (constant memory usage regardless of file size).
 - **Non-blocking**: Asynchronous API running on Rust thread pool, keeping the Node.js event loop free.
 - **Security**: Prevents "Zip Slip" vulnerabilities during decompression.
 - **Cross-Platform**: Consistent behavior on Windows, macOS, and Linux.
@@ -12,6 +12,8 @@
   - Preserves file permissions (Unix execution bits).
   - Supports Zip64 for large files (> 4GB).
   - Glob pattern filtering (exclude files).
+  - Multiple compression algorithms (Deflate, Bzip2, Zstd).
+  - Configurable symlink handling.
 
 ## Installation
 
@@ -36,8 +38,10 @@ async function compress() {
 
     // With options
     const count2 = await zip('./src', './archive_filtered.zip', {
-      level: 9, // 0-9, default is 1
+      level: 9, // 0-9 for deflate, 1-9 for bzip2, 1-22 for zstd
       exclude: ['*.tmp', '.git/**', 'node_modules/**'], // Glob patterns
+      algorithm: 'deflate', // "deflate" (default), "bzip2", or "zstd"
+      followSymlinks: true, // Follow symbolic links (default: false)
     })
   } catch (err) {
     console.error('Compression failed:', err)
@@ -72,8 +76,13 @@ Compresses a directory into a zip file. Returns the number of files compressed.
 
 **Options:**
 
-- `level` (number): Compression level from 0 (store) to 9 (best). Default: `1`.
+- `level` (number): Compression level. Default: `1`. Range depends on algorithm:
+  - `deflate`: 0 (store) to 9 (best)
+  - `bzip2`: 1 to 9
+  - `zstd`: 1 to 22
 - `exclude` (string[]): Array of glob patterns to exclude from the archive.
+- `algorithm` (string): Compression algorithm. Options: `"deflate"` (default), `"bzip2"`, `"zstd"`.
+- `followSymlinks` (boolean): Whether to follow symbolic links. Default: `false`.
 
 ### `unzip(sourcePath: string, outputDir: string): Promise<void>`
 

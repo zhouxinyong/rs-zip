@@ -12,7 +12,6 @@ crate-type = ["cdylib"]
 globset = "0.4"
 napi = "3.0.0"
 napi-derive = "3.0.0"
-rayon = "1.10"
 walkdir = "2.5"
 zip = { version = "6.0.0", features = [
   "deflate",

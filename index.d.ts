@@ -22,19 +22,19 @@ export declare function unzip(sourcePath: string, outputDir: string): Promise<vo
  * * `source_dir` - Source directory path
  * * `output_path` - Output zip file path
  * * `options` - Compression options
- *   - `level`: Compression level (0-9, default: 1)
+ *   - `level`: Compression level (default: 1). Range depends on algorithm:
+ *     deflate: 0-9, bzip2: 1-9, zstd: 1-22
  *   - `exclude`: Array of glob patterns to exclude files
  *   - `algorithm`: Compression algorithm (deflate, bzip2, zstd)
+ *   - `followSymlinks`: Whether to follow symbolic links (default: false)
  */
-export declare function zip(
-  sourceDir: string,
-  outputPath: string,
-  options?: ZipOptions | undefined | null,
-): Promise<number>
+export declare function zip(sourceDir: string, outputPath: string, options?: ZipOptions | undefined | null): Promise<number>
 
 export interface ZipOptions {
   level?: number
   exclude?: Array<string>
   /** Compression algorithm: "deflate" (default), "bzip2", or "zstd" */
   algorithm?: string
+  /** Whether to follow symbolic links (default: false) */
+  followSymlinks?: boolean
 }
