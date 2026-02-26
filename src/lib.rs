@@ -1,19 +1,44 @@
 #![deny(clippy::all)]
 
-use globset::{Glob, GlobSetBuilder};
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use napi::bindgen_prelude::AsyncTask;
 use napi::{Env, Error, Result, Task};
 use napi_derive::napi;
+use rayon::prelude::*;
 use std::borrow::Cow;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
-use std::path::PathBuf;
-use walkdir::WalkDir;
+use std::io::{BufReader, BufWriter, Seek, Write};
+use std::path::{Path, PathBuf};
+use walkdir::{DirEntry, WalkDir};
 
 use zip::write::SimpleFileOptions;
 use zip::CompressionMethod;
 
 const BUF_SIZE: usize = 262144; // 256KB
+
+// Zip format constants
+const LOCAL_FILE_HEADER_SIG: u32 = 0x04034b50;
+const CENTRAL_DIR_HEADER_SIG: u32 = 0x02014b50;
+const END_OF_CENTRAL_DIR_SIG: u32 = 0x06054b50;
+const ZIP64_END_OF_CENTRAL_DIR_SIG: u32 = 0x06064b50;
+const ZIP64_END_OF_CENTRAL_DIR_LOCATOR_SIG: u32 = 0x07064b50;
+const VERSION_MADE_BY: u16 = 0x0314; // Unix + Zip 2.0
+const VERSION_NEEDED_DEFLATE: u16 = 20; // 2.0
+const VERSION_NEEDED_ZIP64: u16 = 45; // 4.5
+const UTF8_FLAG: u16 = 1 << 11;
+
+/// Pre-compressed zip entry produced by parallel workers
+struct CompressedEntry {
+  name: Vec<u8>,
+  compressed_data: Vec<u8>,
+  crc32: u32,
+  uncompressed_size: u64,
+  compressed_size: u64,
+  compression_method: u16,
+  is_dir: bool,
+  #[cfg(unix)]
+  unix_mode: Option<u32>,
+}
 
 /// Normalize path to zip format (forward slashes)
 fn normalize_path(name_str: &str) -> Cow<'_, str> {
@@ -49,6 +74,332 @@ fn validate_compression_level(algorithm: &str, level: i32) -> std::result::Resul
   }
 }
 
+/// Build a compressed entry from a file (designed for parallel execution with rayon)
+fn build_file_entry(
+  name: &str,
+  data: &[u8],
+  compression_method: u16,
+  compression_level: u32,
+  #[cfg(unix)] unix_mode: Option<u32>,
+) -> CompressedEntry {
+  let mut crc = crc32fast::Hasher::new();
+  crc.update(data);
+  let crc32 = crc.finalize();
+  let uncompressed_size = data.len() as u64;
+
+  let compressed_data = if compression_method == 8 {
+    // Deflate
+    let mut encoder = flate2::write::DeflateEncoder::new(
+      Vec::with_capacity(data.len()),
+      flate2::Compression::new(compression_level),
+    );
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
+  } else {
+    // Stored (method 0)
+    data.to_vec()
+  };
+
+  let compressed_size = compressed_data.len() as u64;
+
+  CompressedEntry {
+    name: name.as_bytes().to_vec(),
+    compressed_data,
+    crc32,
+    uncompressed_size,
+    compressed_size,
+    compression_method,
+    is_dir: false,
+    #[cfg(unix)]
+    unix_mode,
+  }
+}
+
+/// Build a directory entry (no I/O or compression needed)
+fn build_dir_entry(
+  name: &str,
+  #[cfg(unix)] unix_mode: Option<u32>,
+) -> CompressedEntry {
+  let mut dir_name = name.as_bytes().to_vec();
+  if !dir_name.ends_with(b"/") {
+    dir_name.push(b'/');
+  }
+  CompressedEntry {
+    name: dir_name,
+    compressed_data: Vec::new(),
+    crc32: 0,
+    uncompressed_size: 0,
+    compressed_size: 0,
+    compression_method: 0, // Stored for directories
+    is_dir: true,
+    #[cfg(unix)]
+    unix_mode,
+  }
+}
+
+/// Check if any entry needs Zip64 extensions
+fn needs_zip64(entries: &[CompressedEntry]) -> bool {
+  entries.len() > u16::MAX as usize
+    || entries
+      .iter()
+      .any(|e| e.compressed_size > u32::MAX as u64 || e.uncompressed_size > u32::MAX as u64)
+}
+
+/// Write a complete zip archive from pre-compressed entries.
+/// This is the fast path: all CPU work (compression + CRC) is already done.
+fn write_zip_archive<W: Write + Seek>(
+  writer: &mut W,
+  entries: &[CompressedEntry],
+) -> std::io::Result<()> {
+  let use_zip64 = needs_zip64(entries);
+  let version_needed = if use_zip64 {
+    VERSION_NEEDED_ZIP64
+  } else {
+    VERSION_NEEDED_DEFLATE
+  };
+
+  let mut offsets = Vec::with_capacity(entries.len());
+
+  // Write local file headers + data
+  for entry in entries {
+    offsets.push(writer.stream_position()?);
+
+    let extra_field = build_extra_field(entry, use_zip64);
+
+    // Local file header
+    writer.write_all(&LOCAL_FILE_HEADER_SIG.to_le_bytes())?;
+    writer.write_all(&version_needed.to_le_bytes())?;
+    writer.write_all(&UTF8_FLAG.to_le_bytes())?; // general purpose bit flag
+    writer.write_all(&entry.compression_method.to_le_bytes())?;
+    writer.write_all(&0u16.to_le_bytes())?; // last mod time
+    writer.write_all(&0u16.to_le_bytes())?; // last mod date
+    writer.write_all(&entry.crc32.to_le_bytes())?;
+
+    if use_zip64 {
+      writer.write_all(&0xFFFFFFFFu32.to_le_bytes())?; // compressed size (in zip64 extra)
+      writer.write_all(&0xFFFFFFFFu32.to_le_bytes())?; // uncompressed size (in zip64 extra)
+    } else {
+      writer.write_all(&(entry.compressed_size as u32).to_le_bytes())?;
+      writer.write_all(&(entry.uncompressed_size as u32).to_le_bytes())?;
+    }
+
+    writer.write_all(&(entry.name.len() as u16).to_le_bytes())?;
+    writer.write_all(&(extra_field.len() as u16).to_le_bytes())?;
+    writer.write_all(&entry.name)?;
+    writer.write_all(&extra_field)?;
+
+    // File data
+    writer.write_all(&entry.compressed_data)?;
+  }
+
+  // Central directory
+  let central_dir_offset = writer.stream_position()?;
+
+  for (i, entry) in entries.iter().enumerate() {
+    let extra_field = build_central_extra_field(entry, offsets[i], use_zip64);
+
+    writer.write_all(&CENTRAL_DIR_HEADER_SIG.to_le_bytes())?;
+    writer.write_all(&VERSION_MADE_BY.to_le_bytes())?;
+    writer.write_all(&version_needed.to_le_bytes())?;
+    writer.write_all(&UTF8_FLAG.to_le_bytes())?; // flags
+    writer.write_all(&entry.compression_method.to_le_bytes())?;
+    writer.write_all(&0u16.to_le_bytes())?; // last mod time
+    writer.write_all(&0u16.to_le_bytes())?; // last mod date
+    writer.write_all(&entry.crc32.to_le_bytes())?;
+
+    if use_zip64 {
+      writer.write_all(&0xFFFFFFFFu32.to_le_bytes())?;
+      writer.write_all(&0xFFFFFFFFu32.to_le_bytes())?;
+    } else {
+      writer.write_all(&(entry.compressed_size as u32).to_le_bytes())?;
+      writer.write_all(&(entry.uncompressed_size as u32).to_le_bytes())?;
+    }
+
+    writer.write_all(&(entry.name.len() as u16).to_le_bytes())?;
+    writer.write_all(&(extra_field.len() as u16).to_le_bytes())?;
+    writer.write_all(&0u16.to_le_bytes())?; // comment length
+    writer.write_all(&0u16.to_le_bytes())?; // disk number start
+    writer.write_all(&0u16.to_le_bytes())?; // internal file attributes
+
+    // External file attributes (Unix permissions in upper 16 bits)
+    #[cfg(unix)]
+    {
+      let mode = entry.unix_mode.unwrap_or(if entry.is_dir { 0o40755 } else { 0o100644 });
+      writer.write_all(&(mode << 16).to_le_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+      let attr: u32 = if entry.is_dir { 0x10 } else { 0 };
+      writer.write_all(&attr.to_le_bytes())?;
+    }
+
+    if use_zip64 {
+      writer.write_all(&0xFFFFFFFFu32.to_le_bytes())?; // offset in zip64 extra
+    } else {
+      writer.write_all(&(offsets[i] as u32).to_le_bytes())?;
+    }
+
+    writer.write_all(&entry.name)?;
+    writer.write_all(&extra_field)?;
+  }
+
+  let central_dir_end = writer.stream_position()?;
+  let central_dir_size = central_dir_end - central_dir_offset;
+
+  if use_zip64 {
+    // Zip64 end of central directory record
+    writer.write_all(&ZIP64_END_OF_CENTRAL_DIR_SIG.to_le_bytes())?;
+    writer.write_all(&44u64.to_le_bytes())?; // size of remaining record
+    writer.write_all(&VERSION_MADE_BY.to_le_bytes())?;
+    writer.write_all(&VERSION_NEEDED_ZIP64.to_le_bytes())?;
+    writer.write_all(&0u32.to_le_bytes())?; // disk number
+    writer.write_all(&0u32.to_le_bytes())?; // disk with central dir
+    writer.write_all(&(entries.len() as u64).to_le_bytes())?;
+    writer.write_all(&(entries.len() as u64).to_le_bytes())?;
+    writer.write_all(&central_dir_size.to_le_bytes())?;
+    writer.write_all(&central_dir_offset.to_le_bytes())?;
+
+    // Zip64 end of central directory locator
+    writer.write_all(&ZIP64_END_OF_CENTRAL_DIR_LOCATOR_SIG.to_le_bytes())?;
+    writer.write_all(&0u32.to_le_bytes())?; // disk with zip64 EOCD
+    writer.write_all(&central_dir_end.to_le_bytes())?;
+    writer.write_all(&1u32.to_le_bytes())?; // total disks
+  }
+
+  // End of central directory record
+  writer.write_all(&END_OF_CENTRAL_DIR_SIG.to_le_bytes())?;
+  writer.write_all(&0u16.to_le_bytes())?; // disk number
+  writer.write_all(&0u16.to_le_bytes())?; // disk with central dir
+
+  if use_zip64 || entries.len() > u16::MAX as usize {
+    writer.write_all(&0xFFFFu16.to_le_bytes())?;
+    writer.write_all(&0xFFFFu16.to_le_bytes())?;
+  } else {
+    writer.write_all(&(entries.len() as u16).to_le_bytes())?;
+    writer.write_all(&(entries.len() as u16).to_le_bytes())?;
+  }
+
+  if use_zip64 {
+    writer.write_all(&0xFFFFFFFFu32.to_le_bytes())?;
+    writer.write_all(&0xFFFFFFFFu32.to_le_bytes())?;
+  } else {
+    writer.write_all(&(central_dir_size as u32).to_le_bytes())?;
+    writer.write_all(&(central_dir_offset as u32).to_le_bytes())?;
+  }
+
+  writer.write_all(&0u16.to_le_bytes())?; // comment length
+
+  writer.flush()?;
+  Ok(())
+}
+
+/// Build extra field for local file header
+fn build_extra_field(entry: &CompressedEntry, use_zip64: bool) -> Vec<u8> {
+  if !use_zip64 {
+    return Vec::new();
+  }
+  // Zip64 extended information extra field (header ID 0x0001)
+  let mut extra = Vec::with_capacity(20);
+  extra.extend_from_slice(&0x0001u16.to_le_bytes()); // header ID
+  extra.extend_from_slice(&16u16.to_le_bytes()); // data size
+  extra.extend_from_slice(&entry.uncompressed_size.to_le_bytes());
+  extra.extend_from_slice(&entry.compressed_size.to_le_bytes());
+  extra
+}
+
+/// Build extra field for central directory header
+fn build_central_extra_field(entry: &CompressedEntry, offset: u64, use_zip64: bool) -> Vec<u8> {
+  if !use_zip64 {
+    return Vec::new();
+  }
+  // Zip64 extended information extra field (header ID 0x0001)
+  let mut extra = Vec::with_capacity(28);
+  extra.extend_from_slice(&0x0001u16.to_le_bytes()); // header ID
+  extra.extend_from_slice(&24u16.to_le_bytes()); // data size
+  extra.extend_from_slice(&entry.uncompressed_size.to_le_bytes());
+  extra.extend_from_slice(&entry.compressed_size.to_le_bytes());
+  extra.extend_from_slice(&offset.to_le_bytes());
+  extra
+}
+
+/// Process a walkdir entry: read file content and compute metadata for parallel processing.
+/// Returns Ok(Some((name, content, mode))) for files, Ok(None) for skipped entries.
+fn collect_entry(
+  entry: &DirEntry,
+  source_dir: &Path,
+  exclude_matcher: &Option<GlobSet>,
+) -> std::result::Result<Option<CollectedEntry>, String> {
+  let path = entry.path();
+  let file_type = entry.file_type();
+
+  let name_path = match path.strip_prefix(source_dir) {
+    Ok(p) => p,
+    Err(_) => return Ok(None),
+  };
+  let name_str = match name_path.to_str() {
+    Some(s) => s,
+    None => return Ok(None),
+  };
+
+  if name_str.is_empty() {
+    return Ok(None);
+  }
+
+  if let Some(ref matcher) = exclude_matcher {
+    if matcher.is_match(name_str) {
+      return Ok(None);
+    }
+  }
+
+  let name = normalize_path(name_str).into_owned();
+
+  if file_type.is_file() {
+    let content =
+      std::fs::read(path).map_err(|e| format!("Failed to read file '{}': {}", name, e))?;
+
+    #[cfg(unix)]
+    let mode = {
+      use std::os::unix::fs::PermissionsExt;
+      entry.metadata().ok().map(|m| m.permissions().mode())
+    };
+
+    Ok(Some(CollectedEntry::File {
+      name,
+      content,
+      #[cfg(unix)]
+      mode,
+    }))
+  } else if file_type.is_dir() {
+    #[cfg(unix)]
+    let mode = {
+      use std::os::unix::fs::PermissionsExt;
+      entry.metadata().ok().map(|m| m.permissions().mode())
+    };
+
+    Ok(Some(CollectedEntry::Dir {
+      name,
+      #[cfg(unix)]
+      mode,
+    }))
+  } else {
+    Ok(None)
+  }
+}
+
+enum CollectedEntry {
+  File {
+    name: String,
+    content: Vec<u8>,
+    #[cfg(unix)]
+    mode: Option<u32>,
+  },
+  Dir {
+    name: String,
+    #[cfg(unix)]
+    mode: Option<u32>,
+  },
+}
+
 #[napi(object)]
 pub struct ZipOptions {
   pub level: Option<i32>,
@@ -70,7 +421,7 @@ impl Task for CompressTask {
   type JsValue = u32;
 
   fn compute(&mut self) -> Result<Self::Output> {
-    // 1. Build GlobSet for pattern matching (with error reporting)
+    // 1. Build GlobSet for pattern matching
     let exclude_matcher = if let Some(ref patterns) = self.options.exclude {
       let mut builder = GlobSetBuilder::new();
       for pattern in patterns {
@@ -87,28 +438,12 @@ impl Task for CompressTask {
       None
     };
 
-    // 2. Configure compression options with per-algorithm level validation
+    // 2. Validate options
     let algorithm_name = self.options.algorithm.as_deref().unwrap_or("deflate");
     let compression_level = self.options.level.unwrap_or(1);
-    let compression_method = match algorithm_name {
-      "deflate" => CompressionMethod::Deflated,
-      "bzip2" => CompressionMethod::Bzip2,
-      "zstd" => CompressionMethod::Zstd,
-      alg => {
-        return Err(Error::from_reason(format!(
-          "Unsupported algorithm '{}'. Valid options: deflate, bzip2, zstd",
-          alg
-        )))
-      }
-    };
 
     validate_compression_level(algorithm_name, compression_level)
       .map_err(Error::from_reason)?;
-
-    let base_options = SimpleFileOptions::default()
-      .compression_method(compression_method)
-      .compression_level(Some(compression_level as i64))
-      .large_file(true);
 
     // 3. Create parent directories for output file
     if let Some(parent) = self.output_path.parent() {
@@ -119,101 +454,209 @@ impl Task for CompressTask {
       }
     }
 
-    // 4. Create zip writer with buffered I/O
+    // Route to the appropriate implementation based on algorithm
+    match algorithm_name {
+      "deflate" | "stored" => self.compress_parallel_deflate(
+        &exclude_matcher,
+        compression_level,
+        algorithm_name == "deflate",
+      ),
+      _ => self.compress_with_zip_crate(&exclude_matcher, algorithm_name, compression_level),
+    }
+  }
+
+  fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+    Ok(output)
+  }
+}
+
+impl CompressTask {
+  /// Fast path: parallel compression + CRC32 with custom zip writer (deflate/stored)
+  fn compress_parallel_deflate(
+    &self,
+    exclude_matcher: &Option<GlobSet>,
+    compression_level: i32,
+    use_deflate: bool,
+  ) -> Result<u32> {
+    let follow_symlinks = self.options.follow_symlinks.unwrap_or(false);
+
+    // 1. Walk directory and collect all entries (fast: just readdir syscalls)
+    let entries: Vec<DirEntry> = WalkDir::new(&self.source_dir)
+      .follow_links(follow_symlinks)
+      .into_iter()
+      .collect::<std::result::Result<Vec<_>, _>>()
+      .map_err(|e| Error::from_reason(format!("Failed to read directory: {}", e)))?;
+
+    // 2. Read files in parallel + filter (rayon parallelizes across CPU cores)
+    let source_dir = &self.source_dir;
+    let collected: Vec<std::result::Result<Option<CollectedEntry>, String>> = entries
+      .par_iter()
+      .map(|entry| collect_entry(entry, source_dir, exclude_matcher))
+      .collect();
+
+    // Check for errors
+    let mut valid_entries = Vec::with_capacity(collected.len());
+    for result in collected {
+      match result {
+        Ok(Some(entry)) => valid_entries.push(entry),
+        Ok(None) => {}
+        Err(e) => return Err(Error::from_reason(e)),
+      }
+    }
+
+    // 3. Compress all entries in parallel (CRC32 + deflate for files)
+    let compression_method: u16 = if use_deflate { 8 } else { 0 };
+    let level = compression_level as u32;
+
+    let compressed_entries: Vec<CompressedEntry> = valid_entries
+      .par_iter()
+      .map(|entry| match entry {
+        CollectedEntry::File {
+          name,
+          content,
+          #[cfg(unix)]
+          mode,
+        } => build_file_entry(
+          name,
+          content,
+          compression_method,
+          level,
+          #[cfg(unix)]
+          *mode,
+        ),
+        CollectedEntry::Dir {
+          name,
+          #[cfg(unix)]
+          mode,
+        } => build_dir_entry(
+          name,
+          #[cfg(unix)]
+          *mode,
+        ),
+      })
+      .collect();
+
+    // 4. Count files
+    let file_count = compressed_entries
+      .iter()
+      .filter(|e| !e.is_dir)
+      .count() as u32;
+
+    // 5. Write the zip archive (sequential, but just raw byte writes - no CPU work)
+    let file = File::create(&self.output_path)
+      .map_err(|e| Error::from_reason(format!("Failed to create zip file: {}", e)))?;
+    let mut buf_writer = BufWriter::with_capacity(BUF_SIZE, file);
+
+    write_zip_archive(&mut buf_writer, &compressed_entries)
+      .map_err(|e| Error::from_reason(format!("Failed to write zip archive: {}", e)))?;
+
+    Ok(file_count)
+  }
+
+  /// Fallback path: use the zip crate for bzip2/zstd (sequential with parallel I/O)
+  fn compress_with_zip_crate(
+    &self,
+    exclude_matcher: &Option<GlobSet>,
+    algorithm_name: &str,
+    compression_level: i32,
+  ) -> Result<u32> {
+    let compression_method = match algorithm_name {
+      "bzip2" => CompressionMethod::Bzip2,
+      "zstd" => CompressionMethod::Zstd,
+      alg => {
+        return Err(Error::from_reason(format!(
+          "Unsupported algorithm '{}'. Valid options: deflate, bzip2, zstd",
+          alg
+        )))
+      }
+    };
+
+    let base_options = SimpleFileOptions::default()
+      .compression_method(compression_method)
+      .compression_level(Some(compression_level as i64));
+
+    let follow_symlinks = self.options.follow_symlinks.unwrap_or(false);
+
+    // Collect entries
+    let entries: Vec<DirEntry> = WalkDir::new(&self.source_dir)
+      .follow_links(follow_symlinks)
+      .into_iter()
+      .collect::<std::result::Result<Vec<_>, _>>()
+      .map_err(|e| Error::from_reason(format!("Failed to read directory: {}", e)))?;
+
+    // Parallel read + channel pipeline
+    let (tx, rx) = std::sync::mpsc::sync_channel::<std::result::Result<CollectedEntry, String>>(
+      128_usize.min(entries.len()),
+    );
+
+    let source_dir = self.source_dir.clone();
+    let exclude_matcher_clone = exclude_matcher.clone();
+
+    rayon::spawn(move || {
+      entries.par_iter().for_each_with(tx, |tx, entry| {
+        match collect_entry(entry, &source_dir, &exclude_matcher_clone) {
+          Ok(Some(data)) => {
+            let _ = tx.send(Ok(data));
+          }
+          Ok(None) => {}
+          Err(e) => {
+            let _ = tx.send(Err(e));
+          }
+        }
+      });
+    });
+
+    // Write to zip
     let file = File::create(&self.output_path)
       .map_err(|e| Error::from_reason(format!("Failed to create zip file: {}", e)))?;
     let buf_writer = BufWriter::with_capacity(BUF_SIZE, file);
     let mut zip = zip::ZipWriter::new(buf_writer);
-
-    let follow_symlinks = self.options.follow_symlinks.unwrap_or(false);
     let mut file_count = 0u32;
 
-    // 5. Walk directory and stream files directly to zip (constant memory usage)
-    let walker = WalkDir::new(&self.source_dir).follow_links(follow_symlinks);
-
-    for result in walker {
-      let entry = result.map_err(|e| {
-        Error::from_reason(format!("Failed to read directory entry: {}", e))
-      })?;
-
-      let path = entry.path();
-      let file_type = entry.file_type();
-
-      // Calculate relative path
-      let name_path = match path.strip_prefix(&self.source_dir) {
-        Ok(p) => p,
-        Err(_) => continue,
-      };
-      let name_str = match name_path.to_str() {
-        Some(s) => s,
-        None => continue,
-      };
-
-      // Skip root directory entry
-      if name_str.is_empty() {
-        continue;
-      }
-
-      // Filter by glob patterns
-      if let Some(ref matcher) = exclude_matcher {
-        if matcher.is_match(name_str) {
-          continue;
-        }
-      }
-
-      let name = normalize_path(name_str).into_owned();
-
-      if file_type.is_file() {
-        let mut options = base_options;
-
-        #[cfg(unix)]
-        {
-          use std::os::unix::fs::PermissionsExt;
-          if let Ok(metadata) = entry.metadata() {
-            options = options.unix_permissions(metadata.permissions().mode());
+    for result in rx {
+      let entry = result.map_err(Error::from_reason)?;
+      match entry {
+        CollectedEntry::File {
+          name,
+          content,
+          #[cfg(unix)]
+          mode,
+        } => {
+          let mut options = base_options;
+          #[cfg(unix)]
+          if let Some(m) = mode {
+            options = options.unix_permissions(m);
           }
+          zip
+            .start_file(&name, options)
+            .map_err(|e| Error::from_reason(format!("Failed to write zip entry: {}", e)))?;
+          zip
+            .write_all(&content)
+            .map_err(|e| Error::from_reason(format!("Failed to write data: {}", e)))?;
+          file_count += 1;
         }
-
-        zip
-          .start_file(&name, options)
-          .map_err(|e| Error::from_reason(format!("Failed to write zip entry: {}", e)))?;
-
-        // Stream file content directly to zip writer (no full file buffering)
-        let f = File::open(path)
-          .map_err(|e| Error::from_reason(format!("Failed to open file '{}': {}", name, e)))?;
-        let mut reader = BufReader::with_capacity(BUF_SIZE, f);
-        std::io::copy(&mut reader, &mut zip)
-          .map_err(|e| Error::from_reason(format!("Failed to write data for '{}': {}", name, e)))?;
-
-        file_count += 1;
-      } else if file_type.is_dir() {
-        let mut options = base_options;
-
-        #[cfg(unix)]
-        {
-          use std::os::unix::fs::PermissionsExt;
-          if let Ok(metadata) = entry.metadata() {
-            options = options.unix_permissions(metadata.permissions().mode());
+        CollectedEntry::Dir {
+          name,
+          #[cfg(unix)]
+          mode,
+        } => {
+          let mut options = base_options;
+          #[cfg(unix)]
+          if let Some(m) = mode {
+            options = options.unix_permissions(m);
           }
+          zip
+            .add_directory(&name, options)
+            .map_err(|e| Error::from_reason(format!("Failed to add directory: {}", e)))?;
         }
-
-        zip
-          .add_directory(&name, options)
-          .map_err(|e| Error::from_reason(format!("Failed to add directory: {}", e)))?;
       }
-      // Symlinks are skipped when follow_links is false
     }
 
-    // 6. Finish writing
     zip
       .finish()
       .map_err(|e| Error::from_reason(format!("Zip finalization failed: {}", e)))?;
 
     Ok(file_count)
-  }
-
-  fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
-    Ok(output)
   }
 }
 
