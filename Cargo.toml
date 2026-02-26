@@ -10,8 +10,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 globset = "0.4"
-crc32fast = "1"
-flate2 = "1"
+crc32fast = "1.4"
+flate2 = "1.1"
 napi = "3.0.0"
 napi-derive = "3.0.0"
 rayon = "1.10"

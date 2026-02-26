@@ -15,6 +15,7 @@ use zip::write::SimpleFileOptions;
 use zip::CompressionMethod;
 
 const BUF_SIZE: usize = 262144; // 256KB
+const CHANNEL_CAPACITY: usize = 128;
 
 // Zip format constants
 const LOCAL_FILE_HEADER_SIG: u32 = 0x04034b50;
@@ -81,7 +82,7 @@ fn build_file_entry(
   compression_method: u16,
   compression_level: u32,
   #[cfg(unix)] unix_mode: Option<u32>,
-) -> CompressedEntry {
+) -> std::result::Result<CompressedEntry, String> {
   let mut crc = crc32fast::Hasher::new();
   crc.update(data);
   let crc32 = crc.finalize();
@@ -93,8 +94,12 @@ fn build_file_entry(
       Vec::with_capacity(data.len()),
       flate2::Compression::new(compression_level),
     );
-    encoder.write_all(data).unwrap();
-    encoder.finish().unwrap()
+    encoder
+      .write_all(data)
+      .map_err(|e| format!("Failed to compress '{}': {}", name, e))?;
+    encoder
+      .finish()
+      .map_err(|e| format!("Failed to finish compression for '{}': {}", name, e))?
   } else {
     // Stored (method 0)
     data.to_vec()
@@ -102,7 +107,7 @@ fn build_file_entry(
 
   let compressed_size = compressed_data.len() as u64;
 
-  CompressedEntry {
+  Ok(CompressedEntry {
     name: name.as_bytes().to_vec(),
     compressed_data,
     crc32,
@@ -112,7 +117,7 @@ fn build_file_entry(
     is_dir: false,
     #[cfg(unix)]
     unix_mode,
-  }
+  })
 }
 
 /// Build a directory entry (no I/O or compression needed)
@@ -508,7 +513,7 @@ impl CompressTask {
     let compression_method: u16 = if use_deflate { 8 } else { 0 };
     let level = compression_level as u32;
 
-    let compressed_entries: Vec<CompressedEntry> = valid_entries
+    let compressed_entries: Vec<std::result::Result<CompressedEntry, String>> = valid_entries
       .par_iter()
       .map(|entry| match entry {
         CollectedEntry::File {
@@ -528,26 +533,29 @@ impl CompressTask {
           name,
           #[cfg(unix)]
           mode,
-        } => build_dir_entry(
+        } => Ok(build_dir_entry(
           name,
           #[cfg(unix)]
           *mode,
-        ),
+        )),
       })
       .collect();
 
+    // Check for compression errors
+    let mut final_entries = Vec::with_capacity(compressed_entries.len());
+    for result in compressed_entries {
+      final_entries.push(result.map_err(Error::from_reason)?);
+    }
+
     // 4. Count files
-    let file_count = compressed_entries
-      .iter()
-      .filter(|e| !e.is_dir)
-      .count() as u32;
+    let file_count = final_entries.iter().filter(|e| !e.is_dir).count() as u32;
 
     // 5. Write the zip archive (sequential, but just raw byte writes - no CPU work)
     let file = File::create(&self.output_path)
       .map_err(|e| Error::from_reason(format!("Failed to create zip file: {}", e)))?;
     let mut buf_writer = BufWriter::with_capacity(BUF_SIZE, file);
 
-    write_zip_archive(&mut buf_writer, &compressed_entries)
+    write_zip_archive(&mut buf_writer, &final_entries)
       .map_err(|e| Error::from_reason(format!("Failed to write zip archive: {}", e)))?;
 
     Ok(file_count)
@@ -586,7 +594,7 @@ impl CompressTask {
 
     // Parallel read + channel pipeline
     let (tx, rx) = std::sync::mpsc::sync_channel::<std::result::Result<CollectedEntry, String>>(
-      128_usize.min(entries.len()),
+      CHANNEL_CAPACITY.min(entries.len()),
     );
 
     let source_dir = self.source_dir.clone();
