@@ -37,8 +37,49 @@ struct CompressedEntry {
   compressed_size: u64,
   compression_method: u16,
   is_dir: bool,
+  last_mod_time: u16,
+  last_mod_date: u16,
   #[cfg(unix)]
   unix_mode: Option<u32>,
+}
+
+/// Convert a SystemTime to DOS date/time format (used by zip format)
+fn system_time_to_dos(time: std::time::SystemTime) -> (u16, u16) {
+  // DOS date: bits 0-4 = day, bits 5-8 = month, bits 9-15 = year offset from 1980
+  // DOS time: bits 0-4 = seconds/2, bits 5-10 = minutes, bits 11-15 = hours
+  let duration = time
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap_or_default();
+  let secs = duration.as_secs();
+
+  // Simple conversion from unix timestamp to date components
+  // Using a basic algorithm that handles dates from 1980-2107
+  let days = (secs / 86400) as i64;
+  let time_of_day = secs % 86400;
+
+  let hours = (time_of_day / 3600) as u16;
+  let minutes = ((time_of_day % 3600) / 60) as u16;
+  let seconds = ((time_of_day % 60) / 2) as u16; // DOS stores seconds/2
+
+  // Calculate date from days since epoch (1970-01-01)
+  // Adapted from Howard Hinnant's algorithm
+  let z = days + 719468;
+  let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+  let doe = (z - era * 146097) as u64;
+  let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  let y = yoe as i64 + era * 400;
+  let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  let mp = (5 * doy + 2) / 153;
+  let d = (doy - (153 * mp + 2) / 5 + 1) as u16;
+  let m = if mp < 10 { mp + 3 } else { mp - 9 } as u16;
+  let y = if m <= 2 { y + 1 } else { y };
+
+  // DOS epoch starts at 1980
+  let year_offset = (y.max(1980) - 1980).min(127) as u16;
+
+  let dos_time = (hours << 11) | (minutes << 5) | seconds;
+  let dos_date = (year_offset << 9) | (m << 5) | d;
+  (dos_time, dos_date)
 }
 
 /// Normalize path to zip format (forward slashes)
@@ -81,6 +122,8 @@ fn build_file_entry(
   data: &[u8],
   compression_method: u16,
   compression_level: u32,
+  last_mod_time: u16,
+  last_mod_date: u16,
   #[cfg(unix)] unix_mode: Option<u32>,
 ) -> std::result::Result<CompressedEntry, String> {
   let mut crc = crc32fast::Hasher::new();
@@ -115,6 +158,8 @@ fn build_file_entry(
     compressed_size,
     compression_method,
     is_dir: false,
+    last_mod_time,
+    last_mod_date,
     #[cfg(unix)]
     unix_mode,
   })
@@ -123,6 +168,8 @@ fn build_file_entry(
 /// Build a directory entry (no I/O or compression needed)
 fn build_dir_entry(
   name: &str,
+  last_mod_time: u16,
+  last_mod_date: u16,
   #[cfg(unix)] unix_mode: Option<u32>,
 ) -> CompressedEntry {
   let mut dir_name = name.as_bytes().to_vec();
@@ -137,6 +184,8 @@ fn build_dir_entry(
     compressed_size: 0,
     compression_method: 0, // Stored for directories
     is_dir: true,
+    last_mod_time,
+    last_mod_date,
     #[cfg(unix)]
     unix_mode,
   }
@@ -176,8 +225,8 @@ fn write_zip_archive<W: Write + Seek>(
     writer.write_all(&version_needed.to_le_bytes())?;
     writer.write_all(&UTF8_FLAG.to_le_bytes())?; // general purpose bit flag
     writer.write_all(&entry.compression_method.to_le_bytes())?;
-    writer.write_all(&0u16.to_le_bytes())?; // last mod time
-    writer.write_all(&0u16.to_le_bytes())?; // last mod date
+    writer.write_all(&entry.last_mod_time.to_le_bytes())?;
+    writer.write_all(&entry.last_mod_date.to_le_bytes())?;
     writer.write_all(&entry.crc32.to_le_bytes())?;
 
     if use_zip64 {
@@ -208,8 +257,8 @@ fn write_zip_archive<W: Write + Seek>(
     writer.write_all(&version_needed.to_le_bytes())?;
     writer.write_all(&UTF8_FLAG.to_le_bytes())?; // flags
     writer.write_all(&entry.compression_method.to_le_bytes())?;
-    writer.write_all(&0u16.to_le_bytes())?; // last mod time
-    writer.write_all(&0u16.to_le_bytes())?; // last mod date
+    writer.write_all(&entry.last_mod_time.to_le_bytes())?;
+    writer.write_all(&entry.last_mod_date.to_le_bytes())?;
     writer.write_all(&entry.crc32.to_le_bytes())?;
 
     if use_zip64 {
@@ -229,7 +278,9 @@ fn write_zip_archive<W: Write + Seek>(
     // External file attributes (Unix permissions in upper 16 bits)
     #[cfg(unix)]
     {
-      let mode = entry.unix_mode.unwrap_or(if entry.is_dir { 0o40755 } else { 0o100644 });
+      let mode = entry
+        .unix_mode
+        .unwrap_or(if entry.is_dir { 0o40755 } else { 0o100644 });
       writer.write_all(&(mode << 16).to_le_bytes())?;
     }
     #[cfg(not(unix))]
@@ -358,6 +409,13 @@ fn collect_entry(
 
   let name = normalize_path(name_str).into_owned();
 
+  // Capture file modification time for zip entry timestamp
+  let modified = entry
+    .metadata()
+    .ok()
+    .and_then(|m| m.modified().ok())
+    .unwrap_or_else(std::time::SystemTime::now);
+
   if file_type.is_file() {
     let content =
       std::fs::read(path).map_err(|e| format!("Failed to read file '{}': {}", name, e))?;
@@ -371,6 +429,7 @@ fn collect_entry(
     Ok(Some(CollectedEntry::File {
       name,
       content,
+      modified,
       #[cfg(unix)]
       mode,
     }))
@@ -383,6 +442,7 @@ fn collect_entry(
 
     Ok(Some(CollectedEntry::Dir {
       name,
+      modified,
       #[cfg(unix)]
       mode,
     }))
@@ -395,11 +455,13 @@ enum CollectedEntry {
   File {
     name: String,
     content: Vec<u8>,
+    modified: std::time::SystemTime,
     #[cfg(unix)]
     mode: Option<u32>,
   },
   Dir {
     name: String,
+    modified: std::time::SystemTime,
     #[cfg(unix)]
     mode: Option<u32>,
   },
@@ -447,15 +509,13 @@ impl Task for CompressTask {
     let algorithm_name = self.options.algorithm.as_deref().unwrap_or("deflate");
     let compression_level = self.options.level.unwrap_or(1);
 
-    validate_compression_level(algorithm_name, compression_level)
-      .map_err(Error::from_reason)?;
+    validate_compression_level(algorithm_name, compression_level).map_err(Error::from_reason)?;
 
     // 3. Create parent directories for output file
     if let Some(parent) = self.output_path.parent() {
       if !parent.as_os_str().is_empty() && !parent.exists() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-          Error::from_reason(format!("Failed to create output directory: {}", e))
-        })?;
+        std::fs::create_dir_all(parent)
+          .map_err(|e| Error::from_reason(format!("Failed to create output directory: {}", e)))?;
       }
     }
 
@@ -519,25 +579,37 @@ impl CompressTask {
         CollectedEntry::File {
           name,
           content,
+          modified,
           #[cfg(unix)]
           mode,
-        } => build_file_entry(
-          name,
-          content,
-          compression_method,
-          level,
-          #[cfg(unix)]
-          *mode,
-        ),
+        } => {
+          let (time, date) = system_time_to_dos(*modified);
+          build_file_entry(
+            name,
+            content,
+            compression_method,
+            level,
+            time,
+            date,
+            #[cfg(unix)]
+            *mode,
+          )
+        }
         CollectedEntry::Dir {
           name,
+          modified,
           #[cfg(unix)]
           mode,
-        } => Ok(build_dir_entry(
-          name,
-          #[cfg(unix)]
-          *mode,
-        )),
+        } => {
+          let (time, date) = system_time_to_dos(*modified);
+          Ok(build_dir_entry(
+            name,
+            time,
+            date,
+            #[cfg(unix)]
+            *mode,
+          ))
+        }
       })
       .collect();
 
@@ -629,6 +701,7 @@ impl CompressTask {
           content,
           #[cfg(unix)]
           mode,
+          ..
         } => {
           let mut options = base_options;
           #[cfg(unix)]
@@ -647,6 +720,7 @@ impl CompressTask {
           name,
           #[cfg(unix)]
           mode,
+          ..
         } => {
           let mut options = base_options;
           #[cfg(unix)]
@@ -727,9 +801,8 @@ impl Task for UncompressTask {
 
   fn compute(&mut self) -> Result<Self::Output> {
     // Ensure output directory exists
-    std::fs::create_dir_all(&self.output_dir).map_err(|e| {
-      Error::from_reason(format!("Failed to create output directory: {}", e))
-    })?;
+    std::fs::create_dir_all(&self.output_dir)
+      .map_err(|e| Error::from_reason(format!("Failed to create output directory: {}", e)))?;
 
     let file = File::open(&self.source_path)
       .map_err(|e| Error::from_reason(format!("Failed to open zip file: {}", e)))?;
