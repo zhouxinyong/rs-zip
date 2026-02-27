@@ -17,6 +17,7 @@ env:
       - .editorconfig
       - docs/**
   pull_request: null
+  workflow_dispatch: null
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -291,6 +292,7 @@ jobs:
           run: yarn test
   publish:
     name: Publish
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: write
