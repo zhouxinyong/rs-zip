@@ -14,6 +14,12 @@ use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+/// Buffer size for I/O operations (256KB)
+const IO_BUFFER_SIZE: usize = 256 * 1024;
+
+/// Number of chunks per thread for parallel compression work distribution
+const CHUNKS_PER_THREAD: usize = 4;
+
 /// File entry metadata for parallel compression
 struct FileEntry {
   path: PathBuf,
@@ -165,7 +171,7 @@ impl Task for CompressTask {
     let chunk_size = if file_entries.is_empty() {
       1
     } else {
-      (file_entries.len() / (rayon::current_num_threads() * 4)).max(1)
+      (file_entries.len() / (rayon::current_num_threads() * CHUNKS_PER_THREAD)).max(1)
     };
 
     let mini_zips: Vec<Result<Vec<u8>>> = file_entries
@@ -205,7 +211,7 @@ impl Task for CompressTask {
     // 5. Create main zip and merge all mini-zip archives
     let file = File::create(&self.output_path)
       .map_err(|e| Error::from_reason(format!("Failed to create zip file: {}", e)))?;
-    let buf_writer = BufWriter::with_capacity(262144, file);
+    let buf_writer = BufWriter::with_capacity(IO_BUFFER_SIZE, file);
     let mut zip = ZipWriter::new(buf_writer);
 
     // Add directories
@@ -311,7 +317,7 @@ impl Task for UncompressTask {
     let file = File::open(&self.source_path)
       .map_err(|e| Error::from_reason(format!("Failed to open zip file: {}", e)))?;
 
-    let buf_reader = BufReader::with_capacity(262144, file);
+    let buf_reader = BufReader::with_capacity(IO_BUFFER_SIZE, file);
     let mut archive = zip::ZipArchive::new(buf_reader)
       .map_err(|e| Error::from_reason(format!("Failed to read zip archive: {}", e)))?;
 
@@ -341,7 +347,7 @@ impl Task for UncompressTask {
 
         let outfile = File::create(&outpath)
           .map_err(|e| Error::from_reason(format!("Failed to create output file: {}", e)))?;
-        let mut buf_writer = BufWriter::with_capacity(262144, outfile);
+        let mut buf_writer = BufWriter::with_capacity(IO_BUFFER_SIZE, outfile);
 
         std::io::copy(&mut file, &mut buf_writer)
           .map_err(|e| Error::from_reason(format!("Failed to decompress file content: {}", e)))?;
