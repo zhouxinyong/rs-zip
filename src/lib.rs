@@ -1,42 +1,38 @@
 #![deny(clippy::all)]
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::{Glob, GlobSetBuilder};
 use napi::bindgen_prelude::AsyncTask;
 use napi::{Env, Error, Result, Task};
 use napi_derive::napi;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Cursor, Write};
 use std::path::PathBuf;
-use walkdir::{DirEntry, WalkDir};
+use walkdir::WalkDir;
 
 use zip::write::SimpleFileOptions;
-use zip::CompressionMethod;
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-/// Prepared file data for parallel reading
-struct FileData {
-  name: String,
-  content: Vec<u8>,
-  #[cfg(unix)]
-  mode: Option<u32>,
-  #[cfg(not(unix))]
-  _mode: (),
-}
+/// Buffer size for I/O operations (256KB)
+const IO_BUFFER_SIZE: usize = 256 * 1024;
 
-/// Prepared directory entry for writing
-struct DirData {
+/// Number of chunks per thread for parallel compression work distribution
+const CHUNKS_PER_THREAD: usize = 4;
+
+/// File entry metadata for parallel compression
+struct FileEntry {
+  path: PathBuf,
   name: String,
   #[cfg(unix)]
   mode: Option<u32>,
-  #[cfg(not(unix))]
-  _mode: (),
 }
 
-/// Result of parallel file collection
-enum EntryData {
-  File(FileData),
-  Dir(DirData),
+/// Directory entry metadata
+struct DirEntry {
+  name: String,
+  #[cfg(unix)]
+  mode: Option<u32>,
 }
 
 #[napi(object)]
@@ -66,65 +62,6 @@ fn normalize_path(name_str: &str) -> Cow<'_, str> {
   #[cfg(not(windows))]
   {
     Cow::Borrowed(name_str)
-  }
-}
-
-/// Process a directory entry for parallel collection
-fn process_entry(
-  entry: &DirEntry,
-  source_dir: &PathBuf,
-  exclude_matcher: &Option<GlobSet>,
-) -> Option<EntryData> {
-  let path = entry.path();
-  let file_type = entry.file_type();
-
-  // Calculate relative path
-  let name_path = path.strip_prefix(source_dir).ok()?;
-  let name_str = name_path.to_str()?;
-
-  // Filter by glob patterns
-  if let Some(ref matcher) = exclude_matcher {
-    if matcher.is_match(name_str) {
-      return None;
-    }
-  }
-
-  let name = normalize_path(name_str).into_owned();
-
-  if file_type.is_file() {
-    // Read file content
-    let content = std::fs::read(path).ok()?;
-
-    #[cfg(unix)]
-    let mode = {
-      use std::os::unix::fs::PermissionsExt;
-      entry.metadata().ok().map(|m| m.permissions().mode())
-    };
-
-    Some(EntryData::File(FileData {
-      name,
-      content,
-      #[cfg(unix)]
-      mode,
-      #[cfg(not(unix))]
-      _mode: (),
-    }))
-  } else if file_type.is_dir() && !name.is_empty() {
-    #[cfg(unix)]
-    let mode = {
-      use std::os::unix::fs::PermissionsExt;
-      entry.metadata().ok().map(|m| m.permissions().mode())
-    };
-
-    Some(EntryData::Dir(DirData {
-      name,
-      #[cfg(unix)]
-      mode,
-      #[cfg(not(unix))]
-      _mode: (),
-    }))
-  } else {
-    None
   }
 }
 
@@ -169,72 +106,135 @@ impl Task for CompressTask {
       .compression_level(Some(compression_level as i64))
       .large_file(true);
 
-    // 3. Collect all entries
-    let entries: Vec<_> = WalkDir::new(&self.source_dir)
+    // 3. Walk directory and collect entries (separate files and directories)
+    let mut file_entries: Vec<FileEntry> = Vec::new();
+    let mut dir_entries: Vec<DirEntry> = Vec::new();
+
+    for entry in WalkDir::new(&self.source_dir)
       .follow_links(false)
       .into_iter()
       .filter_map(|e| e.ok())
-      .collect();
+    {
+      let path = entry.path();
+      let ft = entry.file_type();
 
-    // 4. Parallel processing: pipeline
-    // Use a bounded channel to prevent memory from exploding if reading is faster than writing
-    let (tx, rx) = std::sync::mpsc::sync_channel(32);
+      let name_path = match path.strip_prefix(&self.source_dir) {
+        Ok(p) => p,
+        Err(_) => continue,
+      };
+      let name_str = match name_path.to_str() {
+        Some(s) => s,
+        None => continue,
+      };
 
-    // ARC needed for sharing data across threads
-    let source_dir = self.source_dir.clone();
-
-    // Spawn producer threads
-    rayon::spawn(move || {
-      entries.par_iter().for_each_with(tx, |tx, entry| {
-        if let Some(data) = process_entry(entry, &source_dir, &exclude_matcher) {
-          // If the channel is full, this will block the rayon thread, providing backpressure
-          let _ = tx.send(data);
-        }
-      });
-    });
-
-    // 5. Create zip file and write sequentially
-    let file = File::create(&self.output_path)
-      .map_err(|e| Error::from_reason(format!("Failed to create zip file: {}", e)))?;
-    let buf_writer = BufWriter::with_capacity(262144, file);
-    let mut zip = zip::ZipWriter::new(buf_writer);
-
-    let mut file_count = 0u32;
-
-    // Consumer: write to zip as data arrives
-    for data in rx {
-      match data {
-        EntryData::File(file_data) => {
-          let mut options = base_options;
-
-          #[cfg(unix)]
-          if let Some(mode) = file_data.mode {
-            options = options.unix_permissions(mode);
-          }
-
-          zip
-            .start_file(&file_data.name, options)
-            .map_err(|e| Error::from_reason(format!("Failed to write zip entry: {}", e)))?;
-
-          zip
-            .write_all(&file_data.content)
-            .map_err(|e| Error::from_reason(format!("Failed to write data: {}", e)))?;
-
-          file_count += 1;
-        }
-        EntryData::Dir(dir_data) => {
-          let mut options = base_options;
-
-          #[cfg(unix)]
-          if let Some(mode) = dir_data.mode {
-            options = options.unix_permissions(mode);
-          }
-
-          zip
-            .add_directory(&dir_data.name, options)
-            .map_err(|e| Error::from_reason(format!("Failed to add directory: {}", e)))?;
+      // Filter by glob patterns
+      if let Some(ref matcher) = exclude_matcher {
+        if matcher.is_match(name_str) {
+          continue;
         }
       }
+
+      let name = normalize_path(name_str).into_owned();
+
+      if ft.is_file() {
+        #[cfg(unix)]
+        let mode = {
+          use std::os::unix::fs::PermissionsExt;
+          entry.metadata().ok().map(|m| m.permissions().mode())
+        };
+
+        file_entries.push(FileEntry {
+          path: path.to_path_buf(),
+          name,
+          #[cfg(unix)]
+          mode,
+        });
+      } else if ft.is_dir() && !name.is_empty() {
+        #[cfg(unix)]
+        let mode = {
+          use std::os::unix::fs::PermissionsExt;
+          entry.metadata().ok().map(|m| m.permissions().mode())
+        };
+
+        dir_entries.push(DirEntry {
+          name,
+          #[cfg(unix)]
+          mode,
+        });
+      }
+    }
+
+    // 4. Parallel compression: create mini-zip archives in parallel chunks
+    //    Each chunk is compressed independently by a rayon thread, then merged
+    //    into the main zip without re-compression via merge_archive().
+    let file_count = file_entries.len() as u32;
+    let chunk_size = if file_entries.is_empty() {
+      1
+    } else {
+      (file_entries.len() / (rayon::current_num_threads() * CHUNKS_PER_THREAD)).max(1)
+    };
+
+    let mini_zips: Vec<Result<Vec<u8>>> = file_entries
+      .par_chunks(chunk_size)
+      .map(|chunk| {
+        let cursor = Cursor::new(Vec::new());
+        let mut mini_zip = ZipWriter::new(cursor);
+
+        for fe in chunk {
+          let content = std::fs::read(&fe.path)
+            .map_err(|e| Error::from_reason(format!("Failed to read file: {}", e)))?;
+
+          let mut options = base_options;
+          #[cfg(unix)]
+          if let Some(mode) = fe.mode {
+            options = options.unix_permissions(mode);
+          }
+
+          mini_zip
+            .start_file(&fe.name, options)
+            .map_err(|e| Error::from_reason(format!("Failed to write zip entry: {}", e)))?;
+
+          mini_zip
+            .write_all(&content)
+            .map_err(|e| Error::from_reason(format!("Failed to write data: {}", e)))?;
+        }
+
+        let cursor = mini_zip
+          .finish()
+          .map_err(|e| Error::from_reason(format!("Failed to finish mini zip: {}", e)))?;
+        Ok(cursor.into_inner())
+      })
+      .collect();
+
+    let mini_zips: Vec<Vec<u8>> = mini_zips.into_iter().collect::<Result<Vec<_>>>()?;
+
+    // 5. Create main zip and merge all mini-zip archives
+    let file = File::create(&self.output_path)
+      .map_err(|e| Error::from_reason(format!("Failed to create zip file: {}", e)))?;
+    let buf_writer = BufWriter::with_capacity(IO_BUFFER_SIZE, file);
+    let mut zip = ZipWriter::new(buf_writer);
+
+    // Add directories
+    for dir in &dir_entries {
+      let mut options = base_options;
+      #[cfg(unix)]
+      if let Some(mode) = dir.mode {
+        options = options.unix_permissions(mode);
+      }
+
+      zip
+        .add_directory(&dir.name, options)
+        .map_err(|e| Error::from_reason(format!("Failed to add directory: {}", e)))?;
+    }
+
+    // Merge pre-compressed file entries (no re-compression)
+    for mini_zip_data in mini_zips {
+      let cursor = Cursor::new(mini_zip_data);
+      let source = ZipArchive::new(cursor)
+        .map_err(|e| Error::from_reason(format!("Failed to read mini archive: {}", e)))?;
+      zip
+        .merge_archive(source)
+        .map_err(|e| Error::from_reason(format!("Failed to merge archive: {}", e)))?;
     }
 
     // 6. Finish writing
@@ -317,7 +317,7 @@ impl Task for UncompressTask {
     let file = File::open(&self.source_path)
       .map_err(|e| Error::from_reason(format!("Failed to open zip file: {}", e)))?;
 
-    let buf_reader = BufReader::with_capacity(262144, file);
+    let buf_reader = BufReader::with_capacity(IO_BUFFER_SIZE, file);
     let mut archive = zip::ZipArchive::new(buf_reader)
       .map_err(|e| Error::from_reason(format!("Failed to read zip archive: {}", e)))?;
 
@@ -347,7 +347,7 @@ impl Task for UncompressTask {
 
         let outfile = File::create(&outpath)
           .map_err(|e| Error::from_reason(format!("Failed to create output file: {}", e)))?;
-        let mut buf_writer = BufWriter::with_capacity(262144, outfile);
+        let mut buf_writer = BufWriter::with_capacity(IO_BUFFER_SIZE, outfile);
 
         std::io::copy(&mut file, &mut buf_writer)
           .map_err(|e| Error::from_reason(format!("Failed to decompress file content: {}", e)))?;
